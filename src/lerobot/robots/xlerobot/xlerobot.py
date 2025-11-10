@@ -35,6 +35,7 @@ from ..biwheel_base.biwheel_base import BiWheelBase
 from ..lekiwi_base.lekiwi_base import LeKiwiBase
 from ..robot import Robot
 from ..xlerobot_mount.xlerobot_mount import XLeRobotMount
+from .shared_bus_mode.component_assembly import ComponentBinding, build_shared_components
 from .config_xlerobot import XLeRobotConfig
 
 logger = logging.getLogger(__name__)
@@ -49,10 +50,27 @@ class XLeRobot(Robot):
     def __init__(self, config: XLeRobotConfig):
         super().__init__(config)
         self.config = config
+        self.bus_mode = config.bus_mode
+        self.component_bindings: list[ComponentBinding] = []
+        self.bus_managers: dict[str, Any] = {}
+        self.arm_bindings: list[ComponentBinding] = []
+        self.base_bindings: list[ComponentBinding] = []
+        self.mount_bindings: list[ComponentBinding] = []
 
-        self.arms = BiSO101Follower(replace(config.arms_config)) if config.arms_config else None
-        self.base = self._build_base_robot()
-        self.mount = XLeRobotMount(replace(config.mount_config)) if config.mount_config else None
+        if self.bus_mode == XLeRobotConfig.BUS_MODE_SHARED:
+            bindings, managers = build_shared_components(config)
+            self.component_bindings = bindings
+            self.bus_managers = managers
+            self.arm_bindings = [binding for binding in bindings if binding.role == "arm"]
+            self.base_bindings = [binding for binding in bindings if binding.role == "base"]
+            self.mount_bindings = [binding for binding in bindings if binding.role == "mount"]
+            self.arms = None
+            self.base = None
+            self.mount = None
+        else:
+            self.arms = BiSO101Follower(replace(config.arms_config)) if config.arms_config else None
+            self.base = self._build_base_robot()
+            self.mount = XLeRobotMount(replace(config.mount_config)) if config.mount_config else None
         self.camera_configs = dict(config.cameras)
         self.cameras = make_cameras_from_configs(self.camera_configs)
         self._last_camera_obs: dict[str, np.ndarray] = {
@@ -85,8 +103,7 @@ class XLeRobot(Robot):
             camera_features[cam_key] = (height, width, 3)
         return camera_features
 
-    @cached_property
-    def observation_features(self) -> dict[str, Any]:
+    def _legacy_observation_features(self) -> dict[str, Any]:
         features: dict[str, Any] = {}
         if self.arms:
             features.update(self.arms.observation_features)
@@ -97,8 +114,7 @@ class XLeRobot(Robot):
         features.update(self._cameras_ft)
         return features
 
-    @cached_property
-    def action_features(self) -> dict[str, Any]:
+    def _legacy_action_features(self) -> dict[str, Any]:
         features: dict[str, Any] = {}
         if self.arms:
             features.update(self.arms.action_features)
@@ -108,22 +124,114 @@ class XLeRobot(Robot):
             features.update(self.mount.action_features)
         return features
 
+    def _shared_observation_features(self) -> dict[str, Any]:
+        features: dict[str, Any] = {}
+        for binding in self.component_bindings:
+            comp_features = binding.robot.observation_features
+            if binding.prefix:
+                features.update({f"{binding.prefix}{k}": v for k, v in comp_features.items()})
+            else:
+                features.update(comp_features)
+        features.update(self._cameras_ft)
+        return features
+
+    def _shared_action_features(self) -> dict[str, Any]:
+        features: dict[str, Any] = {}
+        for binding in self.component_bindings:
+            comp_features = binding.robot.action_features
+            if binding.prefix:
+                features.update({f"{binding.prefix}{k}": v for k, v in comp_features.items()})
+            else:
+                features.update(comp_features)
+        return features
+
+    def _shared_components_observation(self) -> dict[str, Any]:
+        obs: dict[str, Any] = {}
+        for binding in self.component_bindings:
+            comp_obs = binding.robot.get_observation()
+            if binding.prefix:
+                obs.update({f"{binding.prefix}{k}": v for k, v in comp_obs.items()})
+            else:
+                obs.update(comp_obs)
+        return obs
+
+    def _connect_shared(self, calibrate: bool) -> None:
+        for binding in self._sorted_bindings_for_connection():
+            binding.robot.connect(calibrate=calibrate)
+
+    def _sorted_bindings_for_connection(self) -> list[ComponentBinding]:
+        priority = {"mount": 0, "base": 1, "arm": 2}
+        return sorted(
+            self.component_bindings,
+            key=lambda binding: (priority.get(binding.role, 3), binding.name),
+        )
+
+    def _send_action_shared(self, action: dict[str, Any]) -> dict[str, Any]:
+        sent: dict[str, Any] = {}
+        for binding in self.component_bindings:
+            component_action = self._extract_component_action(binding, action)
+            if not component_action:
+                continue
+            binding_result = binding.robot.send_action(component_action)
+            if binding.prefix:
+                binding_result = {f"{binding.prefix}{k}": v for k, v in binding_result.items()}
+            sent.update(binding_result)
+        return sent
+
+    def _extract_component_action(self, binding: ComponentBinding, action: dict[str, Any]) -> dict[str, Any]:
+        subset: dict[str, Any] = {}
+        prefixes = [alias for alias in binding.aliases if alias]
+        if not prefixes and binding.prefix:
+            prefixes = [binding.prefix]
+
+        if prefixes:
+            for full_key, value in action.items():
+                for prefix in prefixes:
+                    if full_key.startswith(prefix):
+                        subset[full_key[len(prefix) :]] = value
+                        break
+        else:
+            feature_keys = binding.robot.action_features.keys()
+            for key in feature_keys:
+                if key in action:
+                    subset[key] = action[key]
+
+        return subset
+
+    @cached_property
+    def observation_features(self) -> dict[str, Any]:
+        if self.bus_mode == XLeRobotConfig.BUS_MODE_SHARED:
+            return self._shared_observation_features()
+        return self._legacy_observation_features()
+
+    @cached_property
+    def action_features(self) -> dict[str, Any]:
+        if self.bus_mode == XLeRobotConfig.BUS_MODE_SHARED:
+            return self._shared_action_features()
+        return self._legacy_action_features()
+
     @property
     def is_connected(self) -> bool:
-        components_connected = all(
-            comp.is_connected for comp in (self.arms, self.base, self.mount) if comp is not None
-        )
+        if self.bus_mode == XLeRobotConfig.BUS_MODE_SHARED:
+            components_connected = all(binding.robot.is_connected for binding in self.component_bindings)
+        else:
+            components_connected = all(
+                comp.is_connected for comp in (self.arms, self.base, self.mount) if comp is not None
+            )
         cameras_connected = all(cam.is_connected for cam in self.cameras.values())
         return components_connected and cameras_connected
 
     def connect(self, calibrate: bool = True) -> None:
-        if self.mount:
-            self.mount.connect(calibrate=calibrate)
-        if self.base:
-            handshake = getattr(self.base.config, "handshake_on_connect", True)
-            self.base.connect(calibrate=calibrate, handshake=handshake)
-        if self.arms:
-            self.arms.connect(calibrate=calibrate)
+        if self.bus_mode == XLeRobotConfig.BUS_MODE_SHARED:
+            self._connect_shared(calibrate)
+        else:
+            if self.mount:
+                self.mount.connect(calibrate=calibrate)
+            if self.base:
+                handshake = getattr(self.base.config, "handshake_on_connect", True)
+                self.base.connect(calibrate=calibrate, handshake=handshake)
+            if self.arms:
+                self.arms.connect(calibrate=calibrate)
         for cam in self.cameras.values():
             cam.connect()
 
@@ -133,40 +241,56 @@ class XLeRobot(Robot):
 
     def calibrate(self) -> None:
         logger.info("Calibrating XLeRobot components")
-        if self.base:
-            self.base.calibrate()
-        if self.arms:
-            self.arms.calibrate()
-        if self.mount:
-            self.mount.calibrate()
+        if self.bus_mode == XLeRobotConfig.BUS_MODE_SHARED:
+            for binding in self.component_bindings:
+                binding.robot.calibrate()
+        else:
+            if self.base:
+                self.base.calibrate()
+            if self.arms:
+                self.arms.calibrate()
+            if self.mount:
+                self.mount.calibrate()
 
     def configure(self) -> None:
-        if self.base:
-            self.base.configure()
-        if self.arms:
-            self.arms.configure()
-        if self.mount:
-            self.mount.configure()
+        if self.bus_mode == XLeRobotConfig.BUS_MODE_SHARED:
+            for binding in self.component_bindings:
+                binding.robot.configure()
+        else:
+            if self.base:
+                self.base.configure()
+            if self.arms:
+                self.arms.configure()
+            if self.mount:
+                self.mount.configure()
 
     def setup_motors(self) -> None:
-        if self.arms and hasattr(self.arms, "setup_motors"):
-            self.arms.setup_motors()
-        if self.base and hasattr(self.base, "setup_motors"):
-            self.base.setup_motors()
-        if self.mount and hasattr(self.mount, "setup_motors"):
-            self.mount.setup_motors()
+        if self.bus_mode == XLeRobotConfig.BUS_MODE_SHARED:
+            for binding in self.component_bindings:
+                if hasattr(binding.robot, "setup_motors"):
+                    binding.robot.setup_motors()
+        else:
+            if self.arms and hasattr(self.arms, "setup_motors"):
+                self.arms.setup_motors()
+            if self.base and hasattr(self.base, "setup_motors"):
+                self.base.setup_motors()
+            if self.mount and hasattr(self.mount, "setup_motors"):
+                self.mount.setup_motors()
 
     def get_observation(self) -> dict[str, Any]:
         if not self.is_connected:
             raise DeviceNotConnectedError("XLeRobot is not connected.")
 
-        obs = {}
-        if self.arms:
-            obs.update(self.arms.get_observation())
-        if self.base:
-            obs.update(self.base.get_observation())
-        if self.mount:
-            obs.update(self.mount.get_observation())
+        if self.bus_mode == XLeRobotConfig.BUS_MODE_SHARED:
+            obs = self._shared_components_observation()
+        else:
+            obs = {}
+            if self.arms:
+                obs.update(self.arms.get_observation())
+            if self.base:
+                obs.update(self.base.get_observation())
+            if self.mount:
+                obs.update(self.mount.get_observation())
         for name, cam in self.cameras.items():
             try:
                 frame = cam.async_read()
@@ -184,6 +308,9 @@ class XLeRobot(Robot):
     def send_action(self, action: dict[str, Any]) -> dict[str, Any]:
         if not self.is_connected:
             raise DeviceNotConnectedError("XLeRobot is not connected.")
+
+        if self.bus_mode == XLeRobotConfig.BUS_MODE_SHARED:
+            return self._send_action_shared(action)
 
         arm_prefixes = ("left_", "right_")
         arm_action = {k: v for k, v in action.items() if k.startswith(arm_prefixes)}
@@ -211,27 +338,38 @@ class XLeRobot(Robot):
         return {**sent_arm, **sent_base, **sent_mount}
 
     def disconnect(self) -> None:
-        if self.base and self.base.is_connected:
-            try:
-                if hasattr(self.base, "stop_base"):
-                    self.base.stop_base()
-                self.base.disconnect()
-            except DeviceNotConnectedError:
-                logger.debug("Base already disconnected", exc_info=False)
-            except Exception:
-                logger.warning("Failed to disconnect base", exc_info=True)
-        if self.mount and self.mount.is_connected:
-            try:
-                self.mount.disconnect()
-            except DeviceNotConnectedError:
-                logger.debug("Mount already disconnected", exc_info=False)
-        if self.arms and self.arms.is_connected:
-            try:
-                self.arms.disconnect()
-            except DeviceNotConnectedError:
-                logger.debug("Arms already disconnected", exc_info=False)
-            except Exception:
-                logger.warning("Failed to disconnect arms", exc_info=True)
+        if self.bus_mode == XLeRobotConfig.BUS_MODE_SHARED:
+            for binding in reversed(self._sorted_bindings_for_connection()):
+                robot = binding.robot
+                if robot.is_connected:
+                    try:
+                        robot.disconnect()
+                    except DeviceNotConnectedError:
+                        logger.debug("Component %s already disconnected", binding.name, exc_info=False)
+                    except Exception:
+                        logger.warning("Failed to disconnect component %s", binding.name, exc_info=True)
+        else:
+            if self.base and self.base.is_connected:
+                try:
+                    if hasattr(self.base, "stop_base"):
+                        self.base.stop_base()
+                    self.base.disconnect()
+                except DeviceNotConnectedError:
+                    logger.debug("Base already disconnected", exc_info=False)
+                except Exception:
+                    logger.warning("Failed to disconnect base", exc_info=True)
+            if self.mount and self.mount.is_connected:
+                try:
+                    self.mount.disconnect()
+                except DeviceNotConnectedError:
+                    logger.debug("Mount already disconnected", exc_info=False)
+            if self.arms and self.arms.is_connected:
+                try:
+                    self.arms.disconnect()
+                except DeviceNotConnectedError:
+                    logger.debug("Arms already disconnected", exc_info=False)
+                except Exception:
+                    logger.warning("Failed to disconnect arms", exc_info=True)
         for cam in self.cameras.values():
             try:
                 cam.disconnect()
