@@ -103,7 +103,7 @@ class XLeRobot(Robot):
             camera_features[cam_key] = (height, width, 3)
         return camera_features
 
-    def _legacy_observation_features(self) -> dict[str, Any]:
+    def _separate_observation_features(self) -> dict[str, Any]:
         features: dict[str, Any] = {}
         if self.arms:
             features.update(self.arms.observation_features)
@@ -114,7 +114,7 @@ class XLeRobot(Robot):
         features.update(self._cameras_ft)
         return features
 
-    def _legacy_action_features(self) -> dict[str, Any]:
+    def _separate_action_features(self) -> dict[str, Any]:
         features: dict[str, Any] = {}
         if self.arms:
             features.update(self.arms.action_features)
@@ -202,13 +202,13 @@ class XLeRobot(Robot):
     def observation_features(self) -> dict[str, Any]:
         if self.bus_mode == XLeRobotConfig.BUS_MODE_SHARED:
             return self._shared_observation_features()
-        return self._legacy_observation_features()
+        return self._separate_observation_features()
 
     @cached_property
     def action_features(self) -> dict[str, Any]:
         if self.bus_mode == XLeRobotConfig.BUS_MODE_SHARED:
             return self._shared_action_features()
-        return self._legacy_action_features()
+        return self._separate_action_features()
 
     @property
     def is_connected(self) -> bool:
